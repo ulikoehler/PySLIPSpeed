@@ -26,7 +26,7 @@ from slipspeed.crc import calculate_crc32, verify_crc32, append_crc32, extract_c
 from slipspeed.stats import FrameStatistics
 from slipspeed.connections import (SerialConnection, TCPConnection, TCPServerConnection,
                                    UDPConnection, UDPServerConnection, FileConnection,
-                                   create_connection, Connection)
+                                   create_connection, Connection, _detect_connection_type)
 from slipspeed.streaming import FrameMonitor, hexlify_frame
 
 # Import FrameLogger from slipspeed script
@@ -560,6 +560,31 @@ class TestConnectionAbstractClass:
         assert hasattr(Connection, 'close')
 
 
+class TestDetectConnectionType:
+    """Test _detect_connection_type helper function."""
+    
+    def test_detect_connection_type_regular_file(self):
+        """Detect regular file."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            result = _detect_connection_type(tmp_path)
+            assert result == 'file'
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_detect_connection_type_nonexistent(self):
+        """Detect nonexistent path returns None."""
+        result = _detect_connection_type('/nonexistent/path/that/does/not/exist')
+        assert result is None
+    
+    def test_detect_connection_type_directory(self):
+        """Detect directory returns None."""
+        result = _detect_connection_type('/tmp')
+        assert result is None
+
+
 class TestSerialConnectionMocked:
     """Test SerialConnection with mocked serial port."""
     
@@ -662,6 +687,26 @@ class TestSerialConnectionMocked:
 
             conn = SerialConnection('/dev/ttyUSB0')
             data = conn.read(timeout=1.0)
+            assert data == b"data"
+    
+    def test_serial_connection_read_without_timeout(self):
+        """Test serial connection read without custom timeout."""
+        mock_serial_module = MagicMock()
+        mock_port = MagicMock()
+        mock_port.is_open = True
+        mock_port.read.return_value = b"data"
+        mock_port.timeout = 0.1
+        mock_serial_module.Serial.return_value = mock_port
+
+        with patch('builtins.__import__') as mock_import:
+            def custom_import(name, *args, **kwargs):
+                if name == 'serial':
+                    return mock_serial_module
+                return __import__(name, *args, **kwargs)
+            mock_import.side_effect = custom_import
+
+            conn = SerialConnection('/dev/ttyUSB0')
+            data = conn.read()  # No timeout parameter
             assert data == b"data"
 
 
@@ -853,6 +898,152 @@ class TestCreateConnection:
         
         conn = create_connection('udp-listen:5000')
         mock_udp_server_class.assert_called_once_with('0.0.0.0', 5000, timeout=0.1)
+
+
+class TestUDPConnectionErrorPaths:
+    """Test UDPConnection error paths."""
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_open_error(self, mock_socket_module):
+        """UDP connection handles open errors."""
+        mock_socket_module.socket.side_effect = OSError("Socket error")
+        mock_socket_module.timeout = Exception
+        
+        with pytest.raises(RuntimeError, match="Failed to create UDP socket"):
+            UDPConnection('192.168.1.1', 5000)
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_bind_error(self, mock_socket_module):
+        """UDP connection handles bind errors."""
+        mock_socket = MagicMock()
+        mock_socket.bind.side_effect = OSError("Address in use")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        with pytest.raises(RuntimeError, match="Failed to create UDP socket"):
+            UDPConnection('192.168.1.1', 5000, bind_port=8000)
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_read_timeout(self, mock_socket_module):
+        """UDP connection handles timeout."""
+        import socket as socket_module
+        mock_socket = MagicMock()
+        mock_socket.recvfrom.side_effect = socket_module.timeout("timeout")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = socket_module.timeout
+        
+        conn = UDPConnection('192.168.1.1', 5000)
+        data = conn.read()
+        assert data == b''
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_read_exception(self, mock_socket_module):
+        """UDP connection handles read exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.recvfrom.side_effect = OSError("Connection reset")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPConnection('192.168.1.1', 5000)
+        data = conn.read()
+        assert data == b''
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_write_exception(self, mock_socket_module):
+        """UDP connection handles write exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.sendto.side_effect = OSError("Network unreachable")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPConnection('192.168.1.1', 5000)
+        written = conn.write(b"hello")
+        assert written == 0
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_connection_close_exception(self, mock_socket_module):
+        """UDP connection handles close exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.close.side_effect = OSError("Already closed")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPConnection('192.168.1.1', 5000)
+        conn.close()  # Should not raise
+        assert conn.is_open() is False
+
+
+class TestUDPServerConnectionErrorPaths:
+    """Test UDPServerConnection error paths."""
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_open_error(self, mock_socket_module):
+        """UDP server handles open errors."""
+        mock_socket_module.socket.side_effect = OSError("Socket error")
+        mock_socket_module.timeout = Exception
+        
+        with pytest.raises(RuntimeError, match="Failed to bind UDP server"):
+            UDPServerConnection('0.0.0.0', 5000)
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_bind_error(self, mock_socket_module):
+        """UDP server handles bind errors."""
+        mock_socket = MagicMock()
+        mock_socket.bind.side_effect = OSError("Address in use")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        with pytest.raises(RuntimeError, match="Failed to bind UDP server"):
+            UDPServerConnection('0.0.0.0', 5000)
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_read_timeout(self, mock_socket_module):
+        """UDP server handles timeout."""
+        import socket as socket_module
+        mock_socket = MagicMock()
+        mock_socket.recvfrom.side_effect = socket_module.timeout("timeout")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = socket_module.timeout
+        
+        conn = UDPServerConnection('0.0.0.0', 5000)
+        data = conn.read()
+        assert data == b''
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_read_exception(self, mock_socket_module):
+        """UDP server handles read exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.recvfrom.side_effect = OSError("Connection reset")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPServerConnection('0.0.0.0', 5000)
+        data = conn.read()
+        assert data == b''
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_sendto_exception(self, mock_socket_module):
+        """UDP server handles sendto exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.sendto.side_effect = OSError("Network unreachable")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPServerConnection('0.0.0.0', 5000)
+        written = conn.sendto(b"hello", ('192.168.1.1', 6000))
+        assert written == 0
+    
+    @patch('slipspeed.connections.socket')
+    def test_udp_server_close_exception(self, mock_socket_module):
+        """UDP server handles close exceptions."""
+        mock_socket = MagicMock()
+        mock_socket.close.side_effect = OSError("Already closed")
+        mock_socket_module.socket.return_value = mock_socket
+        mock_socket_module.timeout = Exception
+        
+        conn = UDPServerConnection('0.0.0.0', 5000)
+        conn.close()  # Should not raise
+        assert conn.is_open() is False
     
     @patch('slipspeed.connections.FileConnection')
     def test_create_file_connection(self, mock_file_class):
@@ -869,6 +1060,127 @@ class TestCreateConnection:
         
         conn = create_connection('file:/tmp/test.bin:wb')
         mock_file_class.assert_called_once_with('/tmp/test.bin', mode='wb', timeout=0.1)
+
+
+class TestFileConnection:
+    """Test FileConnection class."""
+    
+    def test_file_connection_open(self):
+        """Open file connection."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')
+            assert conn.is_open() is True
+            conn.close()
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_read(self):
+        """Read from file connection."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(b"test_data")
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')
+            data = conn.read()
+            assert data == b"test_data"
+            conn.close()
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_write(self):
+        """Write to file connection."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='wb')
+            written = conn.write(b"hello")
+            assert written == 5
+            conn.close()
+            
+            # Verify written data
+            with open(tmp_path, 'rb') as f:
+                assert f.read() == b"hello"
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_read_closed(self):
+        """Read returns empty when file is closed."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')
+            conn.close()
+            assert conn.read() == b''
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_write_closed(self):
+        """Write returns 0 when file is closed."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='wb')
+            conn.close()
+            assert conn.write(b"hello") == 0
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_open_error(self):
+        """FileConnection handles open errors."""
+        with pytest.raises(RuntimeError, match="Failed to open file"):
+            FileConnection('/nonexistent/path/that/does/not/exist.bin')
+    
+    def test_file_connection_read_exception(self):
+        """FileConnection handles read exceptions."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')
+            # Close the underlying file to cause read error
+            conn.file.close()
+            data = conn.read()
+            assert data == b''
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_write_exception(self):
+        """FileConnection handles write exceptions."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')  # Open in read mode
+            written = conn.write(b"hello")
+            assert written == 0  # Should fail gracefully
+            conn.close()
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_file_connection_close_exception(self):
+        """FileConnection handles close exceptions."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            conn = FileConnection(tmp_path, mode='rb')
+            # Close file twice to test exception handling
+            conn.file.close()
+            conn.close()  # Should not raise
+            assert conn.is_open() is False
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestCreateConnectionExtended:
+    """Extended tests for create_connection factory function."""
     
     def test_create_connection_udp_invalid_port(self):
         """Create UDP connection with invalid port raises ValueError."""
@@ -924,6 +1236,119 @@ class TestCreateConnection:
         """Invalid UDP listen string raises error."""
         with pytest.raises(ValueError):
             create_connection('udp-listen:invalid')
+    
+    @patch('slipspeed.connections.TCPConnection')
+    def test_create_connection_tcp_url_scheme(self, mock_tcp_class):
+        """Create TCP connection with tcp:// scheme."""
+        mock_tcp_class.return_value = MagicMock()
+        conn = create_connection('tcp://192.168.1.1:5000')
+        mock_tcp_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_serial_url_scheme(self, mock_serial_class):
+        """Create serial connection with serial:// scheme."""
+        mock_serial_class.return_value = MagicMock()
+        conn = create_connection('serial:///dev/ttyUSB0')
+        mock_serial_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_serial_url_scheme_with_baud(self, mock_serial_class):
+        """Create serial connection with serial:// scheme and baudrate."""
+        mock_serial_class.return_value = MagicMock()
+        conn = create_connection('serial:///dev/ttyUSB0:9600')
+        mock_serial_class.assert_called_once()
+    
+    @patch('slipspeed.connections.FileConnection')
+    def test_create_connection_file_url_scheme(self, mock_file_class):
+        """Create file connection with file:// scheme."""
+        mock_file_class.return_value = MagicMock()
+        conn = create_connection('file:///tmp/test.bin')
+        mock_file_class.assert_called_once()
+    
+    @patch('slipspeed.connections.FileConnection')
+    def test_create_connection_file_url_scheme_with_mode(self, mock_file_class):
+        """Create file connection with file:// scheme and mode."""
+        mock_file_class.return_value = MagicMock()
+        conn = create_connection('file:///tmp/test.bin:wb')
+        mock_file_class.assert_called_once()
+    
+    @patch('slipspeed.connections.TCPConnection')
+    def test_create_connection_tcp_url_invalid(self, mock_tcp_class):
+        """Invalid tcp:// scheme raises error."""
+        with pytest.raises(ValueError, match="Invalid TCP connection"):
+            create_connection('tcp://invalid')
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_serial_url_invalid_baud(self, mock_serial_class):
+        """Invalid baudrate in serial:// scheme raises error."""
+        with pytest.raises(ValueError, match="baudrate"):
+            create_connection('serial:///dev/ttyUSB0:notanumber')
+    
+    @patch('slipspeed.connections.FileConnection')
+    def test_create_connection_auto_detect_file(self, mock_file_class):
+        """Auto-detect file connection from path."""
+        mock_file_class.return_value = MagicMock()
+        with patch('slipspeed.connections._detect_connection_type', return_value='file'):
+            conn = create_connection('/tmp/test.bin')
+            mock_file_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_auto_detect_serial(self, mock_serial_class):
+        """Auto-detect serial connection from path."""
+        mock_serial_class.return_value = MagicMock()
+        with patch('slipspeed.connections._detect_connection_type', return_value='serial'):
+            conn = create_connection('/dev/ttyUSB0')
+            mock_serial_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_auto_detect_none_defaults_serial(self, mock_serial_class):
+        """Auto-detect returns None, defaults to serial."""
+        mock_serial_class.return_value = MagicMock()
+        with patch('slipspeed.connections._detect_connection_type', return_value=None):
+            conn = create_connection('/dev/ttyUSB0')
+            mock_serial_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_auto_detect_with_baud(self, mock_serial_class):
+        """Auto-detect serial with baudrate."""
+        mock_serial_class.return_value = MagicMock()
+        with patch('slipspeed.connections._detect_connection_type', return_value='serial'):
+            conn = create_connection('/dev/ttyUSB0:9600')
+            mock_serial_class.assert_called_once()
+    
+    @patch('slipspeed.connections.SerialConnection')
+    def test_create_connection_auto_detect_invalid_baud(self, mock_serial_class):
+        """Auto-detect with invalid baudrate raises error."""
+        with patch('slipspeed.connections._detect_connection_type', return_value='serial'):
+            with pytest.raises(ValueError, match="baudrate"):
+                create_connection('/dev/ttyUSB0:notanumber')
+    
+    @patch('slipspeed.connections.TCPConnection')
+    def test_create_connection_tcp_url_invalid_port(self, mock_tcp_class):
+        """Invalid port in tcp:// scheme raises error."""
+        with pytest.raises(ValueError, match="Invalid port number"):
+            create_connection('tcp://192.168.1.1:notaport')
+    
+    @patch('slipspeed.connections.FileConnection')
+    def test_create_connection_file_url_with_mode(self, mock_file_class):
+        """File connection with mode in file:// scheme."""
+        mock_file_class.return_value = MagicMock()
+        conn = create_connection('file:///tmp/test.bin:wb')
+        mock_file_class.assert_called_once_with('/tmp/test.bin', mode='wb', timeout=0.1)
+    
+    @patch('slipspeed.connections.TCPServerConnection')
+    def test_create_connection_tcp_listen_with_host(self, mock_tcp_server_class):
+        """TCP listen with host in tcp-listen: scheme."""
+        mock_tcp_server_class.return_value = MagicMock()
+        conn = create_connection('tcp-listen:0.0.0.0:5000')
+        mock_tcp_server_class.assert_called_once_with('0.0.0.0', 5000, timeout=0.1)
+    
+    @patch('slipspeed.connections.UDPServerConnection')
+    def test_create_connection_udp_listen_with_host(self, mock_udp_server_class):
+        """UDP listen with host in udp-listen: scheme."""
+        mock_udp_server_class.return_value = MagicMock()
+        conn = create_connection('udp-listen:0.0.0.0:5000')
+        mock_udp_server_class.assert_called_once_with('0.0.0.0', 5000, timeout=0.1)
 
 
 # ============================================================================
