@@ -38,7 +38,7 @@ jobs:
     
     - name: Run Python tests with coverage
       run: |
-        pytest tests/test_slipspeed.py \
+        pytest tests/test_slipstream.py \
           --cov=slipspeed \
           --cov-report=term-missing \
           --cov-report=xml \
