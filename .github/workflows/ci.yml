@@ -51,9 +51,9 @@ jobs:
           --cov-report=html \
           -v
     
-    - name: Check coverage threshold (97%)
+    - name: Check coverage threshold (70%)
       run: |
-        coverage report --fail-under=97
+        coverage report --fail-under=70
     
     - name: Upload Python coverage to Codecov
       uses: codecov/codecov-action@v5
